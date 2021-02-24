@@ -58,6 +58,11 @@ enum MetadataFunction {
     METADATAF_NB
 };
 
+enum MetadataFormat {
+    METADATA_FORMAT_DEFAULT,
+    METADATA_FORMAT_CSV
+};
+
 static const char *const var_names[] = {
     "VALUE1",
     "VALUE2",
@@ -84,6 +89,9 @@ typedef struct MetadataContext {
 
     AVIOContext* avio_context;
     char *file_str;
+
+    int format;
+    char *csv_sep;
 
     int (*compare)(struct MetadataContext *s,
                    const char *value1, const char *value2);
@@ -114,6 +122,10 @@ static const AVOption filt_name##_options[] = { \
     { "expr", "set expression for expr function", OFFSET(expr_str), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, FLAGS }, \
     { "file", "set file where to print metadata information", OFFSET(file_str), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS }, \
     { "direct", "reduce buffering when printing to user-set file or pipe", OFFSET(direct), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS }, \
+    { "format", "set output format", OFFSET(format), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, METADATAF_NB-1, FLAGS, "format" }, \
+    {   "default", "default format",  0, AV_OPT_TYPE_CONST, {.i64 = METADATA_FORMAT_DEFAULT }, 0, 0, FLAGS, "format" }, \
+    {   "csv",     "comma-separated", 0, AV_OPT_TYPE_CONST, {.i64 = METADATA_FORMAT_CSV },     0, 0, FLAGS, "format" }, \
+    { "csv_sep", "set CSV separator (only valid for CSV format)", OFFSET(csv_sep), AV_OPT_TYPE_STRING, {.str=","},  0, 0, FLAGS }, \
     { NULL } \
 }
 
@@ -202,6 +214,58 @@ static void print_file(AVFilterContext *ctx, const char *msg, ...)
     va_end(argument_list);
 }
 
+static void print_csv_escaped(AVFilterContext *ctx, const char *src)
+{
+    MetadataContext *s = ctx->priv;
+
+    char meta_chars[] = {s->csv_sep[0], '"', '\n', '\r', '\0'};
+    int needs_quoting = !!src[strcspn(src, meta_chars)];
+
+    // allocate space for two extra quotes and possibly every char escaped
+    char buf[strlen(src) * 2 + 2];
+
+    int pos = 0;
+
+    if (needs_quoting)
+        buf[pos++] = '"';
+
+    for (int i = 0; i < strlen(src); i++) {
+        if (src[i] == '"')
+            buf[pos++] = '\"';
+        buf[pos++] = src[i];
+    }
+
+    if (needs_quoting)
+        buf[pos++] = '"';
+
+    buf[pos] = '\0';
+
+    s->print(ctx, "%s", buf);
+}
+
+static void csv_escape(const char *src, char **dst, const char csv_sep)
+{
+    char meta_chars[] = {csv_sep, '"', '\n', '\r', '\0'};
+    int needs_quoting = !!src[strcspn(src, meta_chars)];
+
+    int pos = 0;
+
+    if (needs_quoting)
+        *dst[pos++] = '"';
+
+    for (int i = 0; i < strlen(src); i++)
+    {
+        if (src[i] == '"')
+            *dst[pos++] = '\"';
+        *dst[pos++] = src[i];
+    }
+
+    if (needs_quoting)
+        *dst[pos++] = '"';
+
+    *dst[pos] = '\0';
+}
+
 static av_cold int init(AVFilterContext *ctx)
 {
     MetadataContext *s = ctx->priv;
@@ -282,6 +346,33 @@ static av_cold int init(AVFilterContext *ctx)
             s->avio_context->direct = AVIO_FLAG_DIRECT;
     }
 
+    if (s->format == METADATA_FORMAT_CSV) {
+        if (strlen(s->csv_sep) == 0) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "No CSV separator supplied\n");
+            return AVERROR(EINVAL);
+        }
+        if (strlen(s->csv_sep) > 1) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "CSV separator must be one character only\n");
+            return AVERROR(EINVAL);
+        }
+        if (s->csv_sep[0] == '.') {
+            av_log(ctx, AV_LOG_ERROR,
+                   "CSV separator cannot be a single period ('.')\n");
+            return AVERROR(EINVAL);
+        }
+        s->print(
+            ctx,
+            "%s%s%s%s%s%s%s%s%s\n",
+            "frame", s->csv_sep,
+            "pts", s->csv_sep,
+            "pts_time", s->csv_sep,
+            "key", s->csv_sep,
+            "value"
+        );
+    }
+
     return 0;
 }
 
@@ -332,17 +423,59 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         }
         return ff_filter_frame(outlink, frame);
     case METADATA_PRINT:
-        if (!s->key && e) {
-            s->print(ctx, "frame:%-4"PRId64" pts:%-7s pts_time:%s\n",
-                     inlink->frame_count_out, av_ts2str(frame->pts), av_ts2timestr(frame->pts, &inlink->time_base));
-            s->print(ctx, "%s=%s\n", e->key, e->value);
-            while ((e = av_dict_get(*metadata, "", e, AV_DICT_IGNORE_SUFFIX)) != NULL) {
-                s->print(ctx, "%s=%s\n", e->key, e->value);
-            }
-        } else if (e && e->value && (!s->value || (e->value && s->compare(s, e->value, s->value)))) {
-            s->print(ctx, "frame:%-4"PRId64" pts:%-7s pts_time:%s\n",
-                     inlink->frame_count_out, av_ts2str(frame->pts), av_ts2timestr(frame->pts, &inlink->time_base));
-            s->print(ctx, "%s=%s\n", s->key, e->value);
+        switch(s->format) {
+            case METADATA_FORMAT_DEFAULT:
+                if (!s->key && e) {
+                    s->print(ctx, "frame:%-4"PRId64" pts:%-7s pts_time:%s\n",
+                            inlink->frame_count_out, av_ts2str(frame->pts), av_ts2timestr(frame->pts, &inlink->time_base));
+                    s->print(ctx, "%s=%s\n", e->key, e->value);
+                    while ((e = av_dict_get(*metadata, "", e, AV_DICT_IGNORE_SUFFIX)) != NULL) {
+                        s->print(ctx, "%s=%s\n", e->key, e->value);
+                    }
+                } else if (e && e->value && (!s->value || (e->value && s->compare(s, e->value, s->value)))) {
+                    s->print(ctx, "frame:%-4"PRId64" pts:%-7s pts_time:%s\n",
+                            inlink->frame_count_out, av_ts2str(frame->pts), av_ts2timestr(frame->pts, &inlink->time_base));
+                    s->print(ctx, "%s=%s\n", s->key, e->value);
+                }
+                break;
+            case METADATA_FORMAT_CSV:
+                if (!s->key && e) {
+                    s->print(
+                        ctx, "%"PRId64"%s%s%s%s%s",
+                        inlink->frame_count_out, s->csv_sep,
+                        av_ts2str(frame->pts), s->csv_sep,
+                        av_ts2timestr(frame->pts, &inlink->time_base), s->csv_sep
+                    );
+                    print_csv_escaped(ctx, e->key);
+                    s->print(ctx, "%s", s->csv_sep);
+                    print_csv_escaped(ctx, e->value);
+                    while ((e = av_dict_get(*metadata, "", e, AV_DICT_IGNORE_SUFFIX)) != NULL) {
+                        s->print(
+                            ctx, "%"PRId64"%s%s%s%s%s",
+                            inlink->frame_count_out, s->csv_sep,
+                            av_ts2str(frame->pts), s->csv_sep,
+                            av_ts2timestr(frame->pts, &inlink->time_base), s->csv_sep
+                        );
+                        print_csv_escaped(ctx, e->key);
+                        s->print(ctx, "%s", s->csv_sep);
+                        print_csv_escaped(ctx, e->value);
+                        s->print(ctx, "\n");
+                    }
+                } else if (e && e->value && (!s->value || (e->value && s->compare(s, e->value, s->value)))) {
+                    s->print(
+                        ctx, "%"PRId64"%s%s%s%s%s",
+                        inlink->frame_count_out, s->csv_sep,
+                        av_ts2str(frame->pts), s->csv_sep,
+                        av_ts2timestr(frame->pts, &inlink->time_base), s->csv_sep
+                    );
+                    print_csv_escaped(ctx, e->key);
+                    s->print(ctx, "%s", s->csv_sep);
+                    print_csv_escaped(ctx, e->value);
+                    s->print(ctx, "\n");
+                }
+                break;
+            default:
+                av_assert0(0);
         }
         return ff_filter_frame(outlink, frame);
     case METADATA_DELETE:

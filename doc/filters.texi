@@ -25134,6 +25134,20 @@ with AV_LOG_INFO loglevel.
 @item direct
 Reduces buffering in print mode when output is written to a URL set using @var{file}.
 
+@item format
+Set the output format for the print mode.
+
+@table @samp
+@item default
+Default output format
+
+@item csv
+Comma-separated output
+@end table
+
+@item csv_sep
+Set the CSV separator (only valid for CSV format). Default is @code{,}. Must be
+one character and cannot be a period (@code{.}).
 @end table
 
 @subsection Examples
